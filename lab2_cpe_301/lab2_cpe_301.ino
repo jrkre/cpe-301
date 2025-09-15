@@ -1,4 +1,9 @@
-
+/*
+  lab2_cpe_301.ino
+  Created by: Joshua Knight, Nicky Victoriano
+  Date: 9/15/25
+  Description: This program reads two digital inputs and lights up one of four LEDs based on the input combination.
+*/
 
 void setup()
 {
