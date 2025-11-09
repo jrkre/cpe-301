@@ -1,0 +1,7 @@
+{
+    "port": "/dev/tty.usbmodem21201",
+    "configuration": "cpu=atmega2560",
+    "board": "arduino:avr:mega",
+    "programmer": "avrisp",
+    "sketch": "lab9_cpe_301/test.ino"
+}
