@@ -37,27 +37,18 @@ byte in_char;
 
 // ticks[] = number of timer ticks for half-period (counts) for prescaler = 64
 // counts = F_CPU / (2 * prescaler * freq)
-unsigned int ticks[7] = {
-  284, // A  440 Hz
-  253, // B  494 Hz
-  239, // C  523 Hz
-  213, // D  587 Hz
-  190, // E  659 Hz
-  179, // F  698 Hz
-  159  // G  784 Hz
-};
+unsigned int ticks[12]= {18181, 17167, 16194, 15296, 14440, 13628, 12820, 12139, 11461, 10810, 10204};
 
-unsigned char input[7] = {'A','B','C','D','E','F','G'};
-
+unsigned char input[12]= {'a', 'A', 'b', 'c', 'C', 'd', 'D', 'e', 'f', 'F', 'g', 'G'};
 // state
-unsigned int currentCounts = 0;   // counts for half period, 0 means "no tone"
+unsigned int currentCounts = 65535;   // counts for half period, 0 means "no tone"
 unsigned char timer_running = 0;
 
 void setup()
 {
   // PB6 output (Arduino Mega pin 12)
-  *portDDRB |= (1 << 6);
-  *portB &= ~(1 << 6); // drive low initially
+  *portDDRB |= 0x40;
+  *portB &= 0xBF; // drive low initially
 
   // Timer1 -> Normal mode, interrupts enabled (overflow)
   *myTCCR1A = 0x00;
@@ -65,8 +56,8 @@ void setup()
   *myTCCR1C = 0x00;
 
   // Clear pending overflow flag and enable Timer1 overflow interrupt (TOIE1)
-  *myTIFR1 |= (1 << 0);   // write 1 to clear TOV1
-  *myTIMSK1 |= (1 << 0);  // enable TOIE1
+  *myTIFR1 |= 0x1;   // write 1 to clear TOV1
+  *myTIMSK1 |= 0x1;  // enable TOIE1
 
   // UART
   U0init(9600);
@@ -86,14 +77,14 @@ void loop()
     if (in_char == 'q' || in_char == 'Q')
     {
       // Stop tone
-      currentCounts = 0;
+      currentCounts = 65535;
       if (timer_running)
       {
-        *myTCCR1B &= ~(0x07); // clear CS12..CS10 -> stop timer
+        *myTCCR1B &=0xF8; // clear CS12..CS10 -> stop timer
         timer_running = 0;
       }
-      *portB &= ~(1 << 6); // ensure output low
-      U0putchar('\n'); U0putchar('S'); U0putchar('T'); U0putchar('O'); U0putchar('P'); U0putchar('\n');
+      *portB &= 0xBF; // ensure output low
+      // U0putchar('\n'); U0putchar('S'); U0putchar('T'); U0putchar('O'); U0putchar('P'); U0putchar('\n');
     }
     else
     {
@@ -109,9 +100,9 @@ void loop()
 
           if (!timer_running)
           {
-            // start timer with prescaler = 64 (CS12=0, CS11=1, CS10=1) -> bits = 0b011 = 0x03
-            *myTCCR1B &= ~(0x07); // clear prescaler bits
-            *myTCCR1B |= 0x03;    // set prescaler = 64
+            // start the timer
+            *myTCCR1B |= 0x01;
+            // set the running flag
             timer_running = 1;
           }
 
@@ -131,16 +122,15 @@ ISR(TIMER1_OVF_vect)
     return;
 
   // stop timer (clear prescaler)
-  *myTCCR1B &= ~(0x07);
+  *myTCCR1B &= 0xF8;
 
   // preload timer so that overflow happens after 'currentCounts' ticks
   *myTCNT1 = (unsigned int)(65536 - (unsigned long)currentCounts);
 
-  // restart timer with prescaler = 64
-  *myTCCR1B |= 0x03;
+  *myTCCR1B |= 0x01;
 
   // toggle PB6 (mask 0x40)
-  *portB ^= (1 << 6);
+  *portB ^= 0x40;
 }
 
 // ---------------- UART Functions ----------------
