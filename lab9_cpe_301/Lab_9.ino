@@ -35,13 +35,13 @@ void U0putchar(unsigned char data);
 
 byte in_char;
 
-// ticks[] = number of timer ticks for half-period (counts) for prescaler = 64
+// ticks[] = number of timer ticks for half-period (counts) for prescaler = 1
 // counts = F_CPU / (2 * prescaler * freq)
 unsigned int ticks[12]= {18181, 17167, 16194, 15296, 14440, 13628, 12820, 12139, 11461, 10810, 10204};
 
 unsigned char input[12]= {'a', 'A', 'b', 'c', 'C', 'd', 'D', 'e', 'f', 'F', 'g', 'G'};
 // state
-unsigned int currentCounts = 65535;   // counts for half period, 0 means "no tone"
+unsigned int currentCounts = 65535;
 unsigned char timer_running = 0;
 
 void setup()
