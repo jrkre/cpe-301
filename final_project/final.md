@@ -4,7 +4,8 @@ This is the final project for CPE 301 - Embedded Systems Design. The project inv
 
 ## Components Used
 
-- DHT11 Temperature and Humidity Sensor
+- DHT11 Temperature and Humidity Sensor'
+- Water Level Sensor
 - DS3231 Real-Time Clock Module
 - 16x2 LCD Display
 - Stepper Motor

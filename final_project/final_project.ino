@@ -88,6 +88,7 @@ float currentTemp = 0.0;
 float currentHumidity = 0.0;
 float tempThreshold = 15.0;  // TODO: configure temperature threshold
 unsigned int currentVentPosition = 0;  // 0-100
+unsigned char manualModeActive = 0;    // 1 = manual control active
 
 // TIMING VARIABLES
 unsigned long lastTempRead = 0;
@@ -95,10 +96,22 @@ unsigned long lastLCDUpdate = 0;
 unsigned long lastWaterRead = 0;
 unsigned long lastStartPress = 0;
 unsigned long lastResetPress = 0;
+unsigned long lastManualStepTime = 0;
+int lastDesiredVentPosition = -1;  // Track target to avoid repeated commands
+
+// TEMPERATURE SENSOR RETRY TIMING
+unsigned long lastDHTRetryTime = 0;
+const unsigned long DHT_RETRY_INTERVAL = 500;  // 500ms between DHT retries
 
 // ISR FLAGS (for safe communication between ISR and main loop)
 volatile unsigned char startButtonPressed = 0;
 volatile unsigned char resetButtonPressed = 0;
+volatile unsigned char stopButtonHeld = 0;      // 1 = stop button currently held
+
+// ISR DEBOUNCE TIMING (prevent false triggers from EMI)
+volatile unsigned long lastStartISRTime = 0;
+volatile unsigned long lastResetISRTime = 0;
+const unsigned long ISR_DEBOUNCE_TIME = 100;   // 100ms minimum between ISR triggers
 
 // RTC STATUS
 volatile unsigned char rtcAvailable = 0;  // Will be set to 1 if RTC initializes successfully
@@ -108,15 +121,19 @@ const unsigned long TEMP_INTERVAL = 60000;      // 60 seconds
 const unsigned long LCD_INTERVAL = 60000;       // 60 seconds
 const unsigned long WATER_INTERVAL = 100;       // 100 milliseconds
 const unsigned long DEBOUNCE_DELAY = 50;        // debounce delay 50 milliseconds
+const unsigned long MANUAL_STEP_INTERVAL = 150; // manual stepper step interval 150ms
 
 // DEBUG FLAG
-#define DEBUG 0
+#define DEBUG 1
 
 // THRESHOLD VALUES
-#define WATER_THRESHOLD 300  // TODO: configure ADC threshold
+#define WATER_THRESHOLD 150  // TODO: configure ADC threshold
+
+// MANUAL STEPPER CONTROL
+#define MANUAL_STEP_INCREMENT 28  // ~5 degrees (5.69 steps/degree * 5)
 
 // PIN defs
-#define WATER_SENSOR_PIN 22  // Pin 22 (PA0, ADC0)
+#define WATER_SENSOR_PIN 54  // Pin 54 (A0, ADC0)
 #define DHT_PIN 24           // Pin 24 (PA2)
 #define FAN_PIN 50           // Pin 50 (PB3)
 #define START_BUTTON_PIN 18  // Pin 18 (PD3, INT3)
@@ -130,12 +147,12 @@ const unsigned long DEBOUNCE_DELAY = 50;        // debounce delay 50 millisecond
 #define YELLOW_LED_PIN 9     // Pin 9 (PH6)
 
 // LCD pin defs
-#define LCD_RS 11            // Pin 11 (PB5)
-#define LCD_EN 12            // Pin 12 (PB6)
-#define LCD_D4 34            // Pin 34 (PC3)
-#define LCD_D5 35            // Pin 35 (PC2)
-#define LCD_D6 36            // Pin 36 (PC1)
-#define LCD_D7 37            // Pin 37 (PC0)
+#define LCD_RS 12            // Pin 12 (PB6)
+#define LCD_EN 11            // Pin 11 (PB5)
+#define LCD_D4 37            // Pin 37 (PC0)
+#define LCD_D5 36            // Pin 36 (PC1)
+#define LCD_D6 35            // Pin 35 (PC2)
+#define LCD_D7 34            // Pin 34 (PC3)
 
 // STEPPER MOTOR pin defs
 // Try sequence: 44, 47, 46, 45 (reverse of sequential)
@@ -173,6 +190,7 @@ void startFan();
 void stopFan();
 void checkStopButton();
 void handleStepperControl();
+void handleManualStepperControl();
 void adjustVent(int targetPosition);
 const char* getStateName(SystemState state);
 void runHardwareTests();  // Comprehensive hardware test suite
@@ -216,59 +234,48 @@ void setup() {
   }
 
   // DHT11
+  U0puts("DHT11 Initialization...\n");
   dht.begin();
-  delay(2000);  // Give DHT11 time to stabilize after power-on
+  unsigned long dhtInitTime = millis();
+  unsigned long dhtWaitStart = millis();
+  while (millis() - dhtWaitStart < 2000) {
+  }
 
   // LCD
+  U0puts("LCD Initialization...\n");
   lcd.begin(16, 2);
-  delay(100);
-  lcd.clear();
-  delay(100);
   lcd.print("Swamp Cooler");
-  delay(100);
-  lcd.setCursor(0, 1);
-  delay(100);
-  lcd.print("Initializing...");
-  delay(500);
+  
 
-  // Stepper motor
-  stepper.setSpeed(15);  // 15 RPM - faster to minimize interrupt interference
+  // Stepper Motor
+  U0puts("Stepper Motor Initialization...\n");
+  stepper.setSpeed(15);
 
-  // Run comprehensive hardware test suite
-  if (DEBUG)
-  {
+  if (DEBUG) {
+    U0puts("DEBUG MODE: Running hardware tests + additional debug output\n");
     runHardwareTests();
   }
-  
-  // Button interrupts - configure registers directly for claritu
-  *myEICRA |= 0xA0;   // 0b10100000 - INT2 and INT3 on fall
 
-  // EIMSK: Enable INT2 (bit 2) and INT3 (bit 3)
-  *myEIMSK |= 0x0C;   // 0b00001100
+  // Configure button interrupts on falling edge
+  *myEICRA |= 0xA0;
+  *myEIMSK |= 0x0C;
+  *myEIFR |= 0x0C;
 
-  // Clear any pending interrupt flags
-  *myEIFR |= 0x0C;    // Write 1 to clear INT2 and INT3 flags
-
-  // Attach ISRs (these should now work correctly)
   attachInterrupt(digitalPinToInterrupt(START_BUTTON_PIN), startButtonISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(RESET_BUTTON_PIN), resetButtonISR, FALLING);
 
-  // Enable global interrupts (CRITICAL!)
   sei();
 
-  // Read initial temperature for immediate state transition on startup
   readTemperatureHumidity();
 
-  // Set initial state
   currentState = STATE_DISABLED;
   updateStateLEDs();
-  
-  // Display ready message
+
   lcd.clear();
   lcd.print("System Ready");
   lcd.setCursor(0, 1);
   lcd.print("Press START");
-  
+
   logTimestamp("System initialized");
   U0puts("Setup complete. Waiting for Start button...\n");
 }
@@ -300,7 +307,10 @@ void loop() {
     updateLCD();
   }
 
-  // Priority 4: Stop button check (polled with debounce)
+  // Priority 4A: Manual stepper control (NEW)
+  handleManualStepperControl();
+
+  // Priority 4B: Stop button check (polled with debounce)
   checkStopButton();
 
   // Priority 5: Handle Start button press (from ISR)
@@ -375,6 +385,17 @@ void loop() {
             adc_read(0), currentVentPosition);
     U0puts(sensorMsg);
   }
+
+  // FAST water level debug (every 1 second) - to test sensor responsiveness
+  static unsigned long lastFastWaterDebug = 0;
+  if (millis() - lastFastWaterDebug >= 1000 && DEBUG) {
+    lastFastWaterDebug = millis();
+    unsigned int waterADC = adc_read(0);
+    U0puts("WATER ADC: ");
+    char waterStr[10];
+    sprintf(waterStr, "%d\n", waterADC);
+    U0puts(waterStr);
+  }
 }
 
 // UART FUNCTIONS (FROM LAB 8)
@@ -413,78 +434,66 @@ unsigned char bitsToHex(unsigned char bits) {
 
 // ADC FUNCTIONS (FROM LAB 8)
 void adc_init() {
-  // Enable ADC, no auto-trigger, no interrupt, prescaler = 128
-  *my_ADCSRA |= 0x80;   // ADEN = 1
-  *my_ADCSRA &= 0xDF;   // ADATE = 0
-  *my_ADCSRA &= 0xF7;   // ADIE = 0
-  *my_ADCSRA |= 0x07;   // Prescaler = 128
+  // Enable ADC and set prescaler
+  *my_ADCSRA |= 0b10000000;
+  *my_ADCSRA &= 0b11011111;
+  *my_ADCSRA &= 0b11111011;
+  *my_ADCSRA |= 0b00000111;
 
-  // Free-running mode disabled
-  *my_ADCSRB &= 0xF8;   // ADTS2:0 = 000
-  *my_ADCSRB &= 0xF7;   // MUX5 = 0
-
-  // AVCC reference, right-adjust, channel 0
-  *my_ADMUX &= 0x7F;    // REFS1 = 0
-  *my_ADMUX |= 0x40;    // REFS0 = 1 (AVCC with cap)
-  *my_ADMUX &= 0xDF;    // ADLAR = 0 (right adjust)
-  *my_ADMUX &= 0xF0;    // Channel = 0
+  // Configure reference and mode
+  *my_ADCSRB &= 0b11110111;
+  *my_ADCSRB &= 0b11111000;
+  *my_ADMUX &= 0b11011111;
+  *my_ADMUX &= 0b11100000;
+  *my_ADMUX &= 0b01111111;
+  *my_ADMUX |= 0b01000000;
+  *my_ADMUX &= 0b11011111;
+  *my_ADMUX &= 0b11110000;
 }
 
 unsigned int adc_read(unsigned char adc_channel_num) {
-  // Clear and set channel selection bits
-  *my_ADMUX &= 0xE0;
-  *my_ADCSRB &= 0xF7;
+  // Select ADC channel
+  *my_ADMUX &= 0b11100000;
+  *my_ADCSRB &= 0b11110111;
   *my_ADMUX |= (adc_channel_num & 0x07);
 
-  // Take multiple samples and average to filter noise
-  unsigned long sum = 0;
-  const int numSamples = 8;  // Average 8 readings
+  // Start conversion and wait for completion
+  *my_ADCSRA |= 0b01000000;
+  while((*my_ADCSRA & 0x40) != 0);
 
-  for (int i = 0; i < numSamples; i++) {
-    // Start conversion
-    *my_ADCSRA |= 0x40;
-
-    // Wait for completion
-    while((*my_ADCSRA & 0x40) != 0);
-
-    // Accumulate result
-    sum += (*my_ADC_DATA & 0x03FF);
-  }
-
-  // Return averaged 10-bit result
-  return sum / numSamples;
+  return *my_ADC_DATA & 0x03FF;
 }
 
 // GPIO INITIALIZATION
 void gpio_init() {
-  // PORT A: Water sensor (PA0) - input for ADC
-  *portDDRA &= 0xFE;   // 0b11111110 - PA0 as input
-  *portA &= 0xFE;      // 0b11111110 - no pullup for ADC input
+  // PORT A: Water sensor (PA0)
+  *portDDRA &= 0xFE;
+  *portA &= 0xFE;
 
-  // PORT B: LCD RS (PB5), LCD EN (PB6), Fan (PB3) - outputs
-  *portDDRB |= 0x68;   // 0b01101000
-  *portB &= 0x97;      // 0b10010111 -> all low initially
+  // PORT B: LCD RS/EN, Fan
+  *portDDRB |= 0x68;
+  *portB &= 0x97;
 
-  // PORT C: LCD D4-D7 (PC0-PC3) - outputs
-  *portDDRC |= 0x0F;   // 0b00001111
-  *portC &= 0xF0;      // 0b11110000 -> all low
+  // PORT C: LCD D4-D7
+  *portDDRC |= 0x0F;
+  *portC &= 0xF0;
 
-  // PORT D: Start (PD3), Reset (PD2) buttons - inputs with pullups
-  *portDDRD &= 0xF3;   // 0b11110011
-  *portD |= 0x0C;      // 0b00001100 -> enable pullups
+  // PORT D: Start and Reset buttons
+  *portDDRD &= 0xF3;
+  *portD |= 0x0C;
 
-  // PORT H: ALL 4 LEDs - outputs
-  *portDDRH |= 0x78;   // 0b01111000
-  *portH &= 0x87;      // 0b10000111 -> all low
-  *portH |= 0x40;      // Yellow LED ON initially (PH6)
+  // PORT H: State LEDs
+  *portDDRH |= 0x78;
+  *portH &= 0x87;
+  *portH |= 0x40;
 
-  // PORT J: Stop button (PJ1) - input with pullup
-  *portDDRJ &= 0xFD;   // 0b11111101
-  *portJ |= 0x02;      // 0b00000010 -> enable pullup
+  // PORT J: Stop button
+  *portDDRJ &= 0xFD;
+  *portJ |= 0x02;
 
-  // PORT L: Stepper motor (PL2-PL5) - outputs
-  *portDDRL |= 0x3C;   // 0b00111100
-  *portL &= 0xC3;      // 0b11000011 -> all low
+  // PORT L: Stepper motor
+  *portDDRL |= 0x3C;
+  *portL &= 0xC3;
 }
 
 void changeState(SystemState newState) {
@@ -493,6 +502,11 @@ void changeState(SystemState newState) {
   previousState = currentState;
   currentState = newState;
 
+  // Reset stepper target to prevent motor movement on state transition
+  lastDesiredVentPosition = -1;
+
+
+  // Log time and event
   char logMsg[50];
   sprintf(logMsg, "State changed from %s to %s",
           getStateName(previousState), getStateName(currentState));
@@ -560,25 +574,9 @@ void readTemperatureHumidity() {
   currentTemp = dht.readTemperature();
   currentHumidity = dht.readHumidity();
 
-  // Debug: print raw sensor values
-  static unsigned long lastDhtDebug = 0;
-  if (millis() - lastDhtDebug > 10000 && DEBUG) {  // Print every 10 seconds
-    lastDhtDebug = millis();
-    U0puts("DHT DEBUG: Temp raw value: ");
-    U0putchar(isnan(currentTemp) ? 'N' : 'V');  // N=NaN, V=Valid
-    U0puts(" Humidity raw value: ");
-    U0putchar(isnan(currentHumidity) ? 'N' : 'V');
-    U0puts("\n");
-  }
-
   if (isnan(currentTemp) || isnan(currentHumidity)) {
-    // If we get NaN, try reading again
-    delay(500);
-    currentTemp = dht.readTemperature();
-    currentHumidity = dht.readHumidity();
-    if (isnan(currentTemp) || isnan(currentHumidity)) {
-      return;  // Still failed, give up this cycle
-    }
+    // Skip this reading if NaN - will retry on next cycle
+    return;
   }
 
   if (currentState == STATE_IDLE && currentTemp > tempThreshold) {
@@ -635,18 +633,12 @@ void logTimestamp(const char* event) {
 }
 
 void startFan() {
-  for (int i = 0; i <= 255; i += 5) {
-    analogWrite(FAN_PIN, i);
-    delay(10);  // Smooth ramp-up
-  }
+  analogWrite(FAN_PIN, 255);  // Turn fan on at full power
   logTimestamp("Fan started");
 }
 
 void stopFan() {
-  for (int i = 255; i >= 0; i -= 5) {
-    analogWrite(FAN_PIN, i);
-    delay(10);  // Smooth ramp-down
-  }
+  analogWrite(FAN_PIN, 0);  // Turn fan off
   logTimestamp("Fan stopped");
 }
 
@@ -654,8 +646,20 @@ void checkStopButton() {
   static unsigned char lastStopState = 1;
   static unsigned char stableStopState = 1;
   static unsigned long lastStopChange = 0;
+  static unsigned char initialized = 0;
 
   unsigned char currentStopState = (*pinJ >> 1) & 0x01;
+
+  // On first call, sync the stable state to actual pin state
+  if (!initialized) {
+    initialized = 1;
+    stableStopState = currentStopState;
+    lastStopState = currentStopState;
+    return;
+  }
+
+  // Update stop button held state: 1 only when button is actively pressed (pin = 1, active-high wiring)
+  stopButtonHeld = (currentStopState == 1) ? 1 : 0;
 
   // Detect state change and start debounce timer
   if (currentStopState != lastStopState) {
@@ -669,19 +673,21 @@ void checkStopButton() {
     if (currentStopState != stableStopState) {
       stableStopState = currentStopState;
 
-      // Handle button press (transition from 1 to 0)
-      if (currentStopState == 0 && currentState != STATE_DISABLED) {
-        changeState(STATE_DISABLED);
+      // Handle button press (transition from 0 to 1 - button pressed)
+      // STOP button press goes to DISABLED, period. No restore on release.
+      if (currentStopState == 1 && currentState != STATE_DISABLED) {
+        logTimestamp("STOP pressed - going to DISABLED");
+        changeState(STATE_DISABLED);     // Go to DISABLED immediately when pressed
       }
+      // On release (transition from 1 to 0), do nothing - stay in DISABLED
     }
   }
 }
 
-int lastDesiredVentPosition = -1;  // Track target to avoid repeated commands
-
 void handleStepperControl() {
-  // Only adjust vent if position has changed (avoid repeated stepper.step calls)
-  int targetPosition = (currentState == STATE_RUNNING) ? 512 : 0;  // 90 degrees (512 steps)
+  if (manualModeActive) return;
+
+  int targetPosition = (currentState == STATE_RUNNING) ? 512 : 0;
 
   if (targetPosition != lastDesiredVentPosition) {
     adjustVent(targetPosition);
@@ -689,16 +695,57 @@ void handleStepperControl() {
   }
 }
 
+void handleManualStepperControl() {
+  unsigned long now = millis();
+
+  // Activate manual mode if stop button is held
+  if (stopButtonHeld) {
+    manualModeActive = 1;
+
+    // Rate limiting: only move every 150ms
+    if (now - lastManualStepTime < MANUAL_STEP_INTERVAL) {
+      return;
+    }
+
+    // Read button states directly from port registers (active low)
+    unsigned char startBtnState = (*pinD >> 3) & 0x01;  // PD3
+    unsigned char resetBtnState = (*pinD >> 2) & 0x01;  // PD2
+
+    // Check which button is pressed (1 = pressed due to active-high)
+    if (startBtnState == 1) {
+      // Clockwise rotation
+      stepper.step(MANUAL_STEP_INCREMENT);
+      lastManualStepTime = now;
+    }
+    else if (resetBtnState == 1) {
+      // Counter-clockwise rotation
+      stepper.step(-MANUAL_STEP_INCREMENT);
+      lastManualStepTime = now;
+    }
+  }
+  else {
+    // Stop button released, exit manual mode
+    manualModeActive = 0;
+  }
+}
+
 void adjustVent(int targetPosition) {
-  if (currentState == STATE_DISABLED) return;
+  // Don't move vent if in DISABLED state
+  if (currentState == STATE_DISABLED) {
+    return;
+  }
 
   int delta = targetPosition - currentVentPosition;
 
   // Only move stepper if there's an actual change needed
   if (delta == 0) return;
 
-  int steps = (delta * 2048) / 100;
-  stepper.step(steps);
+  // Skip motor movement during state transitions, but always update the position
+  if (currentState == previousState) {
+    int steps = (delta * 2048) / 100;
+    stepper.step(steps);
+  }
+
   currentVentPosition = targetPosition;
 
   char msg[40];
@@ -718,13 +765,21 @@ const char* getStateName(SystemState state) {
 
 // ISR
 void startButtonISR() {
-  startButtonPressed = 1;
-  U0puts("Start button ISR triggered\n");
+  // ISR-level debouncing: only set flag if enough time has passed
+  unsigned long now = millis();
+  if (now - lastStartISRTime >= ISR_DEBOUNCE_TIME) {
+    lastStartISRTime = now;
+    startButtonPressed = 1;
+  }
 }
 
 void resetButtonISR() {
-  resetButtonPressed = 1;
-  U0puts("Reset button ISR triggered\n");
+  // ISR-level debouncing: only set flag if enough time has passed
+  unsigned long now = millis();
+  if (now - lastResetISRTime >= ISR_DEBOUNCE_TIME) {
+    lastResetISRTime = now;
+    resetButtonPressed = 1;
+  }
 }
 
 // HARDWARE TEST SUITE
@@ -737,36 +792,40 @@ void runHardwareTests() {
   // TEST 1: LED TEST
   U0puts("TEST 1: LED INDICATORS\n");
   U0puts("  Testing Yellow LED (Pin 9, PH6)...");
-  *portH |= 0x40;  // Yellow ON
-  delay(500);
-  *portH &= ~0x40;  // Yellow OFF
+  *portH |= 0x40;
+  unsigned long ledWaitStart = millis();
+  while (millis() - ledWaitStart < 500) {}
+  *portH &= ~0x40;
   U0puts(" [OK]\n");
 
   U0puts("  Testing Green LED (Pin 6, PH3)...");
-  *portH |= 0x08;  // Green ON
-  delay(500);
-  *portH &= ~0x08;  // Green OFF
+  *portH |= 0x08;
+  ledWaitStart = millis();
+  while (millis() - ledWaitStart < 500) {}
+  *portH &= ~0x08;
   U0puts(" [OK]\n");
 
   U0puts("  Testing Blue LED (Pin 7, PH4)...");
-  *portH |= 0x10;  // Blue ON
-  delay(500);
-  *portH &= ~0x10;  // Blue OFF
+  *portH |= 0x10;
+  ledWaitStart = millis();
+  while (millis() - ledWaitStart < 500) {}
+  *portH &= ~0x10;
   U0puts(" [OK]\n");
 
   U0puts("  Testing Red LED (Pin 8, PH5)...");
-  *portH |= 0x20;  // Red ON
-  delay(500);
-  *portH &= ~0x20;  // Red OFF
+  *portH |= 0x20;
+  ledWaitStart = millis();
+  while (millis() - ledWaitStart < 500) {}
+  *portH &= ~0x20;
   U0puts(" [OK]\n");
   U0puts("  [PASS] All LEDs working\n\n");
 
   // TEST 2: BUTTON TEST
   U0puts("TEST 2: BUTTON INPUT\n");
   U0puts("  Reading button states (should be LOW with active-HIGH wiring):\n");
-  unsigned char startBtn = (*pinD >> 3) & 0x01;  // PD3
-  unsigned char resetBtn = (*pinD >> 2) & 0x01;  // PD2
-  unsigned char stopBtn = (*pinJ >> 1) & 0x01;   // PJ1
+  unsigned char startBtn = (*pinD >> 3) & 0x01;
+  unsigned char resetBtn = (*pinD >> 2) & 0x01;
+  unsigned char stopBtn = (*pinJ >> 1) & 0x01;
   U0puts("    Start Button (Pin 18): ");
   U0putchar('0' + startBtn);
   U0puts(!startBtn ? " [OK]\n" : " [FAIL - Check wiring]\n");
@@ -788,7 +847,8 @@ void runHardwareTests() {
     char adc_str[20];
     sprintf(adc_str, "%d\n", adc_val);
     U0puts(adc_str);
-    delay(200);
+    unsigned long adcWaitStart = millis();
+    while (millis() - adcWaitStart < 200) {}
   }
   U0puts("  [PASS] ADC working\n\n");
 
@@ -799,7 +859,9 @@ void runHardwareTests() {
   unsigned char dhtPassed = 0;
 
   for (int attempt = 1; attempt <= 5; attempt++) {
-    delay(2000);
+    unsigned long dhtAttemptStart = millis();
+    while (millis() - dhtAttemptStart < 2000) {}
+
     temp = dht.readTemperature();
     humid = dht.readHumidity();
 
@@ -808,7 +870,6 @@ void runHardwareTests() {
     U0puts(": ");
 
     if (!isnan(temp) && !isnan(humid)) {
-      // Print temp
       int tempInt = (int)temp;
       int tempDec = (int)((temp - tempInt) * 10);
       if (tempInt < 10) U0putchar('0');
@@ -817,7 +878,6 @@ void runHardwareTests() {
       U0putchar('0' + tempDec);
       U0puts("C  ");
 
-      // Print humidity
       int humidInt = (int)humid;
       int humidDec = (int)((humid - humidInt) * 10);
       if (humidInt < 10) U0putchar('0');
@@ -844,40 +904,45 @@ void runHardwareTests() {
   U0puts("TEST 5: LCD DISPLAY (Pins 11,12,34-37)\n");
   U0puts("  Clearing LCD and writing test pattern...\n");
   lcd.clear();
-  delay(100);
+  unsigned long lcdTestWaitStart = millis();
+  while (millis() - lcdTestWaitStart < 100) {}
+
   lcd.setCursor(0, 0);
   lcd.print("TEST:OK?");
-  delay(100);
+  lcdTestWaitStart = millis();
+  while (millis() - lcdTestWaitStart < 100) {}
+
   lcd.setCursor(0, 1);
   lcd.print("Line2:OK?");
-  delay(2000);
+  lcdTestWaitStart = millis();
+  while (millis() - lcdTestWaitStart < 2000) {}
+
   U0puts("  [CHECK] Does LCD show 'TEST:OK?' on line 1?\n");
   U0puts("          and 'Line2:OK?' on line 2?\n");
-  U0puts("  (If blank, adjust contrast pot on LCD module)\n");
-  U0puts("  Waiting 5 seconds...\n");
-  for (int i = 5; i > 0; i--) {
-    delay(1000);
-    U0putchar('0' + i);
-    U0puts("...");
-  }
-  U0puts("\n\n");
+  U0puts("  (If blank, adjust contrast pot on LCD module)\n\n");
 
   // TEST 6: STEPPER MOTOR TEST
   U0puts("TEST 6: STEPPER MOTOR (Pins 44,46,45,47)\n");
   U0puts("  Rotating stepper motor forward 1 full turn...\n");
-  U0puts("  [LISTEN] Can you hear/feel the motor moving?\n");
-  stepper.step(2048);  // Full rotation
-  delay(1000);
+  U0puts("  Can you see the stepper motor rotating?\n");
+  stepper.step(2048);
+  unsigned long stepperWaitStart = millis();
+  while (millis() - stepperWaitStart < 1000) {}
+
   U0puts("  Rotating stepper motor backward 1 full turn...\n");
   stepper.step(-2048);
-  delay(1000);
+  stepperWaitStart = millis();
+  while (millis() - stepperWaitStart < 1000) {}
+
   U0puts("  [PASS] Stepper motor test complete\n\n");
 
   // TEST 7: FAN MOTOR TEST
   U0puts("TEST 7: FAN MOTOR (Pin 50, PWM)\n");
   U0puts("  Turning fan ON at full power...\n");
   analogWrite(FAN_PIN, 255);
-  delay(2000);
+  unsigned long fanWaitStart = millis();
+  while (millis() - fanWaitStart < 2000) {}
+
   U0puts("  [LISTEN] Can you hear the fan running?\n");
   U0puts("  Turning fan OFF...\n");
   analogWrite(FAN_PIN, 0);
@@ -885,7 +950,6 @@ void runHardwareTests() {
 
   U0puts("====================================\n");
   U0puts("  TEST SUITE COMPLETE\n");
-  U0puts("  System starting in 3 seconds...\n");
+  U0puts("  System starting...\n");
   U0puts("====================================\n\n");
-  delay(3000);
 }
