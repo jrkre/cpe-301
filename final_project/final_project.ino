@@ -86,7 +86,7 @@ volatile SystemState previousState = STATE_DISABLED;
 // SENSORS & CONTROLS
 float currentTemp = 0.0;
 float currentHumidity = 0.0;
-float tempThreshold = 15.0;  // TODO: configure temperature threshold
+float tempThreshold = 15.0;
 unsigned int currentVentPosition = 0;  // 0-100
 unsigned char manualModeActive = 0;    // 1 = manual control active
 
@@ -127,10 +127,10 @@ const unsigned long MANUAL_STEP_INTERVAL = 150; // manual stepper step interval 
 #define DEBUG 1
 
 // THRESHOLD VALUES
-#define WATER_THRESHOLD 150  // TODO: configure ADC threshold
+#define WATER_THRESHOLD 150
 
 // MANUAL STEPPER CONTROL
-#define MANUAL_STEP_INCREMENT 28  // ~5 degrees (5.69 steps/degree * 5)
+#define MANUAL_STEP_INCREMENT 28  // ~5 degrees per button press
 
 // PIN defs
 #define WATER_SENSOR_PIN 54  // Pin 54 (A0, ADC0)
@@ -307,7 +307,7 @@ void loop() {
     updateLCD();
   }
 
-  // Priority 4A: Manual stepper control (NEW)
+  // Priority 4A: Manual stepper control
   handleManualStepperControl();
 
   // Priority 4B: Stop button check (polled with debounce)
